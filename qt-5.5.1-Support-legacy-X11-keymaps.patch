@@ -1,0 +1,500 @@
+diff --git a/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.cpp b/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.cpp
+index ea541e4..7d2f6db 100644
+--- a/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.cpp
++++ b/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.cpp
+@@ -53,6 +53,10 @@
+ #undef KeyRelease
+ #endif
+ 
++#ifdef XCB_USE_XLIB
++#include "qxlibconvenience.h"
++#endif
++
+ #ifndef XK_ISO_Left_Tab
+ #define XK_ISO_Left_Tab         0xFE20
+ #endif
+@@ -679,9 +683,201 @@ void QXcbKeyboard::printKeymapError(const char *error) const
+                   "directory contains recent enough contents, to update please see http://cgit.freedesktop.org/xkeyboard-config/ .";
+ }
+ 
++#ifdef XCB_USE_XLIB
++static void FixShifted (int& unshifted, int& shifted)
++{
++    int u_lower, u_upper;
++    qt_XConvertCase (unshifted, u_lower, u_upper);
++    if ((u_lower != u_upper)            // Check if symbol is cased
++        && (unshifted == u_upper)       // Unshifted must be upper case
++        && (shifted == QT_NoSymbol))    // No shifted symbol
++    {
++        unshifted = u_lower;
++        shifted = u_upper;
++    }
++}
++
++struct xkb_keymap * QXcbKeyboard::keymapFromCore()
++{
++    /* Construct an XKB keymap string from information queried through
++     * Xlib functions */
++    QString keymap;
++    keymap += QStringLiteral ("xkb_keymap {\n");
++
++    int min_keycode = 8;
++    int max_keycode = 255;
++    qt_XDisplayKeycodes(connection()->xlib_display(), &min_keycode, &max_keycode);
++
++    // Generate symbolic names from keycodes
++    {
++        keymap += QStringLiteral (
++			"xkb_keycodes \"core\" {\n"
++			"\tminimum = %1;\n"
++			"\tmaximum = %2;\n").arg (min_keycode).arg(max_keycode);
++        for (int code = min_keycode; code <= max_keycode; code++)
++        {
++            keymap += QStringLiteral ("<K%1> = %1;\n").arg (code);
++        }
++        // TODO?: indicators
++        keymap += QStringLiteral ("};\n"); // xkb_keycodes
++    }
++
++    /* Set up default types (xkbcommon automatically assigns these to
++     * symbols, but doesn't have shift infos) */
++    keymap += QStringLiteral (
++        "xkb_types \"core\" {\n"
++        "virtual_modifiers NumLock,LevelThree;\n"
++        "type \"ONE_LEVEL\" {\n"
++            "modifiers= none;\n"
++        "};\n"
++        "type \"TWO_LEVEL\" {\n"
++            "modifiers= Shift;\n"
++            "map[Shift]= Level2;\n"
++        "};\n"
++        "type \"ALPHABETIC\" {\n"
++            "modifiers= Shift+Lock;\n"
++            "map[Shift]= Level2;\n"
++            "map[Lock]= Level2;\n"
++        "};\n"
++        "type \"KEYPAD\" {\n"
++            "modifiers= Shift+NumLock;\n"
++            "map[Shift]= Level2;\n"
++            "map[NumLock]= Level2;\n"
++        "};\n"
++        "type \"FOUR_LEVEL\" {\n"
++            "modifiers= Shift+LevelThree;\n"
++            "map[Shift]= Level2;\n"
++            "map[LevelThree]= Level3;\n"
++            "map[Shift+LevelThree]= Level4;\n"
++        "};\n"
++        "type \"FOUR_LEVEL_ALPHABETIC\" {\n"
++            "modifiers= Shift+Lock+LevelThree;\n"
++            "map[Shift]= Level2;\n"
++            "map[Lock]= Level2;\n"
++            "map[LevelThree]= Level3;\n"
++            "map[Shift+LevelThree]= Level4;\n"
++            "map[Lock+LevelThree]= Level4;\n"
++            "map[Shift+Lock+LevelThree]= Level3;\n"
++        "};\n"
++        "type \"FOUR_LEVEL_SEMIALPHABETIC\" {\n"
++            "modifiers= Shift+Lock+LevelThree;\n"
++            "map[Shift]= Level2;\n"
++            "map[Lock]= Level2;\n"
++            "map[LevelThree]= Level3;\n"
++            "map[Shift+LevelThree]= Level4;\n"
++            "map[Lock+LevelThree]= Level3;\n"
++            "preserve[Lock+LevelThree]= Lock;\n"
++            "map[Shift+Lock+LevelThree]= Level4;\n"
++            "preserve[Shift+Lock+LevelThree]= Lock;\n"
++        "};\n"
++        "type \"FOUR_LEVEL_KEYPAD\" {\n"
++            "modifiers= Shift+NumLock+LevelThree;\n"
++            "map[Shift]= Level2;\n"
++            "map[NumLock]= Level2;\n"
++            "map[LevelThree]= Level3;\n"
++            "map[Shift+LevelThree]= Level4;\n"
++            "map[NumLock+LevelThree]= Level4;\n"
++            "map[Shift+NumLock+LevelThree]= Level3;\n"
++        "};\n"
++        "};\n"); // xkb_types
++
++    // Generate mapping between symbolic names and keysyms
++    {
++        QVector<int> xkeymap;
++        int keysyms_per_keycode = 0;
++        xkeymap = qt_XGetKeyboardMapping (connection()->xlib_display(),
++                                          min_keycode,
++                                          (max_keycode - min_keycode + 1),
++                                          &keysyms_per_keycode);
++        if (xkeymap.isEmpty()) return 0;
++
++        KeysymModifierMap keysym_mods (keysymsToModifiers ());
++
++        keymap += QStringLiteral ("xkb_symbols \"core\" {\n");
++        for (int code = min_keycode; code <= max_keycode; code++)
++        {
++            const int* code_map = xkeymap.constData() + (code - min_keycode) * keysyms_per_keycode;
++
++            /* Fix symbols so the unshifted and shifted symbols have
++             * lower resp. upper case */
++            int fixed_syms[4];
++            for (int i = 0; i < 4; i++)
++            {
++                fixed_syms[i] = (i < keysyms_per_keycode) ? code_map[i] : QT_NoSymbol;
++            }
++            FixShifted (fixed_syms[0], fixed_syms[1]);
++            FixShifted (fixed_syms[2], fixed_syms[3]);
++
++            int last_sym = 3;
++            while ((last_sym >= 0) && (fixed_syms[last_sym] == QT_NoSymbol))
++                last_sym--;
++            if (last_sym < 0) continue;
++
++            keymap += QStringLiteral ("key <K%1> { symbols[Group1] = [").arg (code);
++            for (int sym_i = 0; sym_i <= last_sym; sym_i++)
++            {
++                int sym = fixed_syms[sym_i];
++                const char* sym_str = (sym == QT_NoSymbol) ? "NoSymbol" : qt_XKeysymToString (sym);
++                if (sym_i > 0) keymap += ", ";
++                if (sym_str && *sym_str)
++                {
++                    keymap += QString::fromLocal8Bit (sym_str);
++                }
++                else
++                {
++                    // Fall back to hex code
++                    keymap += QStringLiteral ("U%1").arg (sym, 0, 16);
++                }
++            }
++            keymap += QStringLiteral ("]");
++            // AltGr
++            if ((last_sym == 0) && (fixed_syms[0] == XKB_KEY_Mode_switch))
++            {
++                keymap += QStringLiteral (", virtualMods=LevelThree");
++            }
++            keymap += QStringLiteral (" };\n"); // key
++
++            // Generate modifier mappings
++            if (last_sym == 0)
++            {
++                static const char* const builtin_modifiers[] =
++                { "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5" };
++                static const int num_builtin_modifiers =
++                    sizeof(builtin_modifiers)/sizeof(builtin_modifiers[0]);
++
++                const char* modifier = 0;
++                int mod_num = keysym_mods.value (fixed_syms[0], -1);
++                if ((mod_num >= 0) && (mod_num < num_builtin_modifiers))
++                    modifier = builtin_modifiers[mod_num];
++                if (modifier)
++                    keymap += QStringLiteral ("modifier_map %1 { <K%2> };\n").arg (QString::fromLocal8Bit (modifier)).arg (code);
++            }
++        }
++        // TODO: indicators?
++        keymap += QStringLiteral ("};\n"); // xkb_symbols
++    }
++
++    /* An xkb_compatibility section is needed, but leave it empty
++     * (modifiers handling is done by modifier_map above). */
++    keymap += QStringLiteral (
++        "xkb_compatibility \"core\" {\n"
++        "};\n"); // xkb_compatibility
++
++    keymap += QStringLiteral ("};\n"); // xkb_keymap
++
++    QByteArray keymap_buf (keymap.toLatin1());
++    return xkb_keymap_new_from_buffer (xkb_context,
++                                       keymap_buf.constData(),
++                                       keymap_buf.size(),
++                                       XKB_KEYMAP_FORMAT_TEXT_V1,
++                                       (xkb_keymap_compile_flags)0);
++}
++#endif
++
+ void QXcbKeyboard::updateKeymap()
+ {
+     m_config = true;
++    m_keymap_is_core = false;
+     // set xkb context object
+     if (!xkb_context) {
+         if (qEnvironmentVariableIsSet("QT_XKB_CONFIG_ROOT")) {
+@@ -715,9 +911,23 @@ void QXcbKeyboard::updateKeymap()
+     }
+ #endif
+     if (!xkb_keymap) {
+-        // Compile a keymap from RMLVO (rules, models, layouts, variants and options) names
++        // Read xkb RMLVO (rules, models, layouts, variants and options) names
+         readXKBConfig();
+-        xkb_keymap = xkb_keymap_new_from_names(xkb_context, &xkb_names, (xkb_keymap_compile_flags)0);
++    #ifdef XCB_USE_XLIB
++        bool rmlvo_is_default = !xkb_names.rules || !(*xkb_names.rules)
++            || !xkb_names.model || !(*xkb_names.model)
++            || !xkb_names.layout || !(*xkb_names.layout);
++        if (rmlvo_is_default) {
++            // Try to build xkb map from core mapping information
++            xkb_keymap = keymapFromCore ();
++            m_keymap_is_core = xkb_keymap != 0;
++        }
++    #endif
++        if (!xkb_keymap)
++        {
++            // Compile a keymap from RMLVO (rules, models, layouts, variants and options) names
++            xkb_keymap = xkb_keymap_new_from_names(xkb_context, &xkb_names, (xkb_keymap_compile_flags)0);
++        }
+         if (!xkb_keymap) {
+             // last fallback is to used hard-coded keymap name, see DEFAULT_XKB_* in xkbcommon.pri
+             qWarning() << "Qt: Could not determine keyboard configuration data"
+@@ -791,6 +1001,7 @@ void QXcbKeyboard::updateXKBStateFromCore(quint16 state)
+                               0,
+                               (state >> 13) & 3); // bits 13 and 14 report the state keyboard group
+ 
++
+         if ((newState & XKB_STATE_LAYOUT_EFFECTIVE) == XKB_STATE_LAYOUT_EFFECTIVE) {
+             //qWarning("TODO: Support KeyboardLayoutChange on QPA (QTBUG-27681)");
+         }
+@@ -1009,7 +1220,7 @@ QList<int> QXcbKeyboard::possibleKeys(const QKeyEvent *event) const
+         Qt::KeyboardModifiers neededMods = ModsTbl[i];
+         if ((modifiers & neededMods) == neededMods) {
+             if (i == 8) {
+-                if (isLatin(baseQtKey))
++                if (isLatin(baseQtKey) || m_keymap_is_core)
+                     continue;
+                 // add a latin key as a fall back key
+                 sym = lookupLatinKeysym(keycode);
+@@ -1296,14 +1507,42 @@ void QXcbKeyboard::updateVModToRModMapping()
+ #endif
+ }
+ 
++// Small helper: set modifier bit, if modifier position is valid
++static inline void ApplyModifier (uint& mask, int modifier)
++{
++    if ((modifier >= 0) && (modifier < 8))
++    {
++        mask |= 1 << modifier;
++    }
++}
++
+ void QXcbKeyboard::updateModifiers()
+ {
++    memset(&rmod_masks, 0, sizeof(rmod_masks));
++
++    KeysymModifierMap keysym_mods (keysymsToModifiers ());
++    ApplyModifier (rmod_masks.alt,   keysym_mods.value (XK_Alt_L,   -1));
++    ApplyModifier (rmod_masks.alt,   keysym_mods.value (XK_Alt_R,   -1));
++    ApplyModifier (rmod_masks.meta,  keysym_mods.value (XK_Meta_L,  -1));
++    ApplyModifier (rmod_masks.meta,  keysym_mods.value (XK_Meta_R,  -1));
++    ApplyModifier (rmod_masks.altgr, keysym_mods.value (XK_Mode_switch,  -1));
++    ApplyModifier (rmod_masks.super, keysym_mods.value (XK_Super_L, -1));
++    ApplyModifier (rmod_masks.super, keysym_mods.value (XK_Super_R, -1));
++    ApplyModifier (rmod_masks.hyper, keysym_mods.value (XK_Hyper_L, -1));
++    ApplyModifier (rmod_masks.hyper, keysym_mods.value (XK_Hyper_R, -1));
++
++    resolveMaskConflicts();
++}
++
++QXcbKeyboard::KeysymModifierMap QXcbKeyboard::keysymsToModifiers ()
++{
+     // The core protocol does not provide a convenient way to determine the mapping
+     // of modifier bits. Clients must retrieve and search the modifier map to determine
+     // the keycodes bound to each modifier, and then retrieve and search the keyboard
+     // mapping to determine the keysyms bound to the keycodes. They must repeat this
+     // process for all modifiers whenever any part of the modifier mapping is changed.
+-    memset(&rmod_masks, 0, sizeof(rmod_masks));
++
++    KeysymModifierMap map;
+ 
+     xcb_generic_error_t *error = 0;
+     xcb_connection_t *conn = xcb_connection();
+@@ -1313,7 +1552,7 @@ void QXcbKeyboard::updateModifiers()
+     if (error) {
+         qWarning("Qt: failed to get modifier mapping");
+         free(error);
+-        return;
++        return map;
+     }
+ 
+     // for Alt and Meta L and R are the same
+@@ -1330,34 +1569,33 @@ void QXcbKeyboard::updateModifiers()
+ 
+     xcb_keycode_t *modMap = xcb_get_modifier_mapping_keycodes(modMapReply);
+     const int w = modMapReply->keycodes_per_modifier;
+-    for (size_t i = 0; i < numSymbols; ++i) {
+-        for (int bit = 0; bit < 8; ++bit) {
+-            uint mask = 1 << bit;
+-            for (int x = 0; x < w; ++x) {
+-                xcb_keycode_t keyCode = modMap[x + bit * w];
+-                xcb_keycode_t *itk = modKeyCodes[i];
+-                while (itk && *itk != XCB_NO_SYMBOL)
+-                    if (*itk++ == keyCode) {
+-                        uint sym = symbols[i];
+-                        if ((sym == XK_Alt_L || sym == XK_Alt_R))
+-                            rmod_masks.alt = mask;
+-                        if ((sym == XK_Meta_L || sym == XK_Meta_R))
+-                            rmod_masks.meta = mask;
+-                        if (sym == XK_Mode_switch)
+-                            rmod_masks.altgr = mask;
+-                        if ((sym == XK_Super_L) || (sym == XK_Super_R))
+-                            rmod_masks.super = mask;
+-                        if ((sym == XK_Hyper_L) || (sym == XK_Hyper_R))
+-                            rmod_masks.hyper = mask;
+-                    }
++    const int num_codes = xcb_get_modifier_mapping_keycodes_length(modMapReply);
++
++    for (int i = 0; i < num_codes; i++)
++    {
++        xcb_keysym_t sym = XCB_NO_SYMBOL;
++        // Get key symbol for key code
++        for (size_t k = 0; k < numSymbols; k++)
++        {
++            if (modKeyCodes[k] && (*(modKeyCodes[k]) == modMap[i]))
++            {
++                sym = symbols[k];
++                break;
+             }
+         }
++        // Key code is for modifier. Record mapping
++        if (sym != XCB_NO_SYMBOL)
++        {
++            int mod = i / w;
++            map[sym] = mod;
++        }
+     }
+ 
+     for (size_t i = 0; i < numSymbols; ++i)
+         free(modKeyCodes[i]);
+     free(modMapReply);
+-    resolveMaskConflicts();
++
++    return map;
+ }
+ 
+ void QXcbKeyboard::resolveMaskConflicts()
+@@ -1450,7 +1688,6 @@ void QXcbKeyboard::handleKeyEvent(xcb_window_t sourceWindow, QEvent::Type type,
+         targetWindow->updateNetWmUserTime(time);
+ 
+     xcb_keysym_t sym = xkb_state_key_get_one_sym(xkb_state, code);
+-
+     QPlatformInputContext *inputContext = QGuiApplicationPrivate::platformIntegration()->inputContext();
+     QMetaMethod method;
+ 
+diff --git a/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.h b/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.h
+index d2e37d6..59373a0 100644
+--- a/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.h
++++ b/qtbase/src/plugins/platforms/xcb/qxcbkeyboard.h
+@@ -86,8 +86,13 @@ protected:
+ 
+     void readXKBConfig();
+     void clearXKBConfig();
++#ifdef XCB_USE_XLIB
++    struct xkb_keymap * keymapFromCore();
++#endif
+     // when XKEYBOARD not present on the X server
+     void updateModifiers();
++    typedef QMap<xcb_keysym_t, int> KeysymModifierMap;
++    KeysymModifierMap keysymsToModifiers ();
+     // when XKEYBOARD is present on the X server
+     void updateVModMapping();
+     void updateVModToRModMapping();
+@@ -97,6 +102,7 @@ protected:
+ 
+ private:
+     bool m_config;
++    bool m_keymap_is_core;
+     xcb_keycode_t m_autorepeat_code;
+ 
+     struct xkb_context *xkb_context;
+diff --git a/qtbase/src/plugins/platforms/xcb/qxlibconvenience.cpp b/qtbase/src/plugins/platforms/xcb/qxlibconvenience.cpp
+index f3c7d2b..9302a76 100644
+--- a/qtbase/src/plugins/platforms/xcb/qxlibconvenience.cpp
++++ b/qtbase/src/plugins/platforms/xcb/qxlibconvenience.cpp
+@@ -34,6 +34,7 @@
+ #ifdef XCB_USE_XLIB
+ 
+ #include "qxlibconvenience.h"
++#include "QtCore/QVector"
+ 
+ // Some Xlib headers are heavy macro namespace polluters and conflict with Qt types.
+ // This unit makes it easier to deal with them by encapsulating these includes in this .cpp.
+@@ -58,6 +59,37 @@ xcb_keysym_t q_XLookupString(void *display, xcb_window_t window, xcb_window_t ro
+     return sym;
+ }
+ 
++void qt_XDisplayKeycodes(void *display, int *min_keycodes_return, int *max_keycodes_return)
++{
++    XDisplayKeycodes (static_cast<Display*> (display), min_keycodes_return, max_keycodes_return);
++}
++
++QVector<int> qt_XGetKeyboardMapping(void *display, int first_keycode, int keycode_count, int *keysyms_per_keycode_return)
++{
++    KeySym* xkeymap = XGetKeyboardMapping (static_cast<Display*> (display), first_keycode, keycode_count, keysyms_per_keycode_return);
++    if (!xkeymap) return QVector<int> ();
++    int num_syms = keycode_count * (*keysyms_per_keycode_return);
++    QVector<int> q_keymap (num_syms);
++    for (int i = 0; i < num_syms; i++)
++        q_keymap[i] = xkeymap[i];
++    XFree (xkeymap);
++    return q_keymap;
++}
++
++const char * qt_XKeysymToString(int keysym)
++{
++    return XKeysymToString (static_cast<KeySym> (keysym));
++}
++
++void qt_XConvertCase(int keysym, int& lower_return, int& upper_return)
++{
++    KeySym xkeysym (static_cast<KeySym> (keysym));
++    KeySym xlower, xupper;
++    XConvertCase (xkeysym, &xlower, &xupper);
++    lower_return = static_cast<int> (xlower);
++    upper_return = static_cast<int> (xupper);
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif
+diff --git a/qtbase/src/plugins/platforms/xcb/qxlibconvenience.h b/qtbase/src/plugins/platforms/xcb/qxlibconvenience.h
+index 0e6e1c3..e86ee36 100644
+--- a/qtbase/src/plugins/platforms/xcb/qxlibconvenience.h
++++ b/qtbase/src/plugins/platforms/xcb/qxlibconvenience.h
+@@ -39,9 +39,16 @@
+ #include <xcb/xcb_keysyms.h>
+ #include <QByteArray>
+ 
++#define QT_NoSymbol    0
++
+ QT_BEGIN_NAMESPACE
+ 
+ xcb_keysym_t q_XLookupString(void *display, xcb_window_t window, xcb_window_t root, uint state, xcb_keycode_t code, int type, QByteArray *chars);
++void qt_XDisplayKeycodes(void *display, int *min_keycodes_return, int *max_keycodes_return);
++QVector<int> qt_XGetKeyboardMapping(void *display, int first_keycode, int keycode_count, int *keysyms_per_keycode_return);
++const char * qt_XKeysymToString(int keysym);
++void qt_XConvertCase(int keysym, int& lower_return, int& upper_return);
++
+ 
+ QT_END_NAMESPACE
+ 
+diff --git a/qtbase/src/plugins/platforms/xcb/xcb_qpa_lib.pro b/qtbase/src/plugins/platforms/xcb/xcb_qpa_lib.pro
+index 1298756..dff4106 100644
+--- a/qtbase/src/plugins/platforms/xcb/xcb_qpa_lib.pro
++++ b/qtbase/src/plugins/platforms/xcb/xcb_qpa_lib.pro
+@@ -27,7 +27,8 @@ SOURCES = \
+         qxcbcursor.cpp \
+         qxcbimage.cpp \
+         qxcbxsettings.cpp \
+-        qxcbsystemtraytracker.cpp
++        qxcbsystemtraytracker.cpp \
++        qxlibconvenience.cpp
+ 
+ HEADERS = \
+         qxcbclipboard.h \
+@@ -45,7 +46,8 @@ HEADERS = \
+         qxcbcursor.h \
+         qxcbimage.h \
+         qxcbxsettings.h \
+-        qxcbsystemtraytracker.h
++        qxcbsystemtraytracker.h \
++        qxlibconvenience.h
+ 
+ LIBS += $$QMAKE_LIBS_DYNLOAD
+ 
+-- 
+1.7.1
+
