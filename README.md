@@ -1,2 +1,3 @@
 # QtLegacyXKeyboard
-Patches for Qt to support legacy X keyboard input
+
+Synthesizes an XKB keymap from X Core Keyboard information if the server doesn't provide xkb layout identity information.
